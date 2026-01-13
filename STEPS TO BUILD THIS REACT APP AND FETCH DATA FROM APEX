@@ -1,0 +1,405 @@
+# React + Lightning Container Component (LCC) + Apex (Real Salesforce Data)
+
+**Purpose**
+This document is a step-by-step, implementation-ready guide for building a custom React application, packaging it as a Salesforce Static Resource, hosting it inside an Aura `lightning:container`, calling Apex from React to fetch real Salesforce data, deploying the solution, and launching it from the App Launcher.
+
+This guide assumes:
+- You are using Salesforce Lightning Experience.
+- You are hosting the React app in an Aura component using `lightning:container`.
+- You want the React app to fetch **real Salesforce data at runtime** by calling Apex **without implementing a separate login flow**.
+
+> Important clarification: “Without authentication” here means **you do not implement OAuth/login inside the React app**. The user is already authenticated in Salesforce; the React app runs inside that authenticated context.
+
+---
+
+## 1) Architecture Overview (What You’re Building)
+
+### Components
+1. **React App** (third‑party framework)
+   - Compiled into static files (`index.html`, `static/js/*`, `static/css/*`).
+   - Packaged into a **Static Resource** zip.
+
+2. **Aura Wrapper**
+   - Hosts the React app in an iframe using `lightning:container`.
+   - Optionally handles message/error callbacks via `onmessage` / `onerror`.
+
+3. **Apex Controller for React Calls**
+   - Used by the React app to retrieve Salesforce data.
+
+### How React calls Apex in LCC
+- The LCC JavaScript SDK (`lightning-container` npm module) ultimately routes Apex calls through **Visualforce Remoting**.
+- Visualforce Remoting requires Apex methods annotated with **`@RemoteAction`**.
+
+**Key rule:**
+- If you want to call Apex from an LCC iframe using `LCC.callApex`, your Apex method must be reachable via Visualforce Remoting (typically `@RemoteAction`).
+
+---
+
+## 2) Prerequisites
+
+### On your machine
+- Node.js + npm
+- Salesforce CLI (`sf`)
+- A Salesforce org (scratch org, sandbox, or dev org)
+
+### In Salesforce org
+- You have permissions to deploy:
+  - Apex classes
+  - Aura components
+  - Static resources
+  - Tabs / Apps / Permission Sets (optional but recommended)
+
+---
+
+## 3) Step-by-Step: Create the React App
+
+### 3.1 Create app
+```bash
+npx create-react-app react-lcc-demo
+cd react-lcc-demo
+```
+
+### 3.2 Install LCC SDK
+```bash
+npm install lightning-container
+```
+
+### 3.3 Configure CRA for Static Resource hosting
+Edit `package.json` and add:
+```json
+{
+  "homepage": "."
+}
+```
+
+Why this matters:
+- CRA uses `homepage` to generate the correct asset URLs.
+- Static Resources are served from a nested path; you need **relative paths**, not absolute.
+
+---
+
+## 4) Step-by-Step: Add LCC Manifest
+
+Create `public/manifest.json`:
+```json
+{
+  "landing-pages": [
+    {
+      "path": "index.html",
+      "apex-controller": "LCC_RemotingController"
+    }
+  ],
+  "csp-compliance": "low"
+}
+```
+
+Notes:
+- `landing-pages.path` is the entry file.
+- `apex-controller` is the Apex controller name used by the remoting runtime.
+- `csp-compliance` must be `"low"` when you need Apex services from LCC.
+
+---
+
+## 5) Step-by-Step: Write Apex to Return Real Data
+
+Create an Apex class in your Salesforce project:
+
+### 5.1 Example controller: Accounts query
+```apex
+global with sharing class LCC_RemotingController {
+
+    @RemoteAction
+    global static String ping() {
+        return 'pong';
+    }
+
+    @RemoteAction
+    global static List<Account> getAccounts(Integer limitCount, Integer offsetCount) {
+        Integer limitSafe = (limitCount != null && limitCount > 0) ? Math.min(limitCount, 200) : 20;
+        Integer offsetSafe = (offsetCount != null && offsetCount >= 0) ? offsetCount : 0;
+
+        // Use WITH SECURITY_ENFORCED so CRUD/FLS are honored.
+        // Only select fields your UI actually needs; otherwise FLS can fail.
+        return [
+            SELECT Id, Name, Phone, Type, NumberOfEmployees
+            FROM Account
+            WITH SECURITY_ENFORCED
+            ORDER BY Name
+            LIMIT :limitSafe
+            OFFSET :offsetSafe
+        ];
+    }
+}
+```
+
+### 5.2 Why `@RemoteAction` (not only `@AuraEnabled`)
+- Aura/LWC uses `@AuraEnabled`.
+- Visualforce Remoting uses `@RemoteAction`.
+- LCC’s Apex bridge is based on Visualforce Remoting, so `@RemoteAction` is required for the LCC call path.
+
+---
+
+## 6) Step-by-Step: Call Apex from React (Simple Example)
+
+### 6.1 Create a small client wrapper
+Create `src/services/apexClient.js`:
+
+```js
+import LCC from "lightning-container";
+
+export function callApex(action, params = []) {
+  return new Promise((resolve, reject) => {
+    const callback = (result, event) => {
+      if (event?.status) {
+        resolve(result);
+      } else {
+        reject(event);
+      }
+    };
+
+    // Preferred: invoke remoting directly with spread params.
+    // This matches how Visualforce Remoting expects arguments:
+    // invokeAction(action, p1, p2, ..., callback, config)
+    if (window.Visualforce?.remoting?.Manager?.invokeAction) {
+      window.Visualforce.remoting.Manager.invokeAction(
+        action,
+        ...params,
+        callback,
+        { escape: true }
+      );
+      return;
+    }
+
+    // Fallback: LCC SDK (works in many orgs, but depends on how the SDK passes params)
+    if (LCC?.callApex) {
+      LCC.callApex(action, params, callback, { escape: true });
+      return;
+    }
+
+    reject(new Error("Not running inside LCC / remoting not available"));
+  });
+}
+```
+
+### 6.2 Use it in a component
+Example `src/App.js`:
+
+```js
+import React, { useEffect, useState } from "react";
+import { callApex } from "./services/apexClient";
+
+export default function App() {
+  const [accounts, setAccounts] = useState([]);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    callApex("LCC_RemotingController.getAccounts", [20, 0])
+      .then(setAccounts)
+      .catch((e) => setError(e?.message || e?.statusCode || "Apex call failed"));
+  }, []);
+
+  return (
+    <div style={{ padding: 16 }}>
+      <h2>Accounts (Live from Salesforce)</h2>
+      {error && <div style={{ color: "#b91c1c" }}>{String(error)}</div>}
+      <table width="100%" cellPadding="8" style={{ borderCollapse: "collapse" }}>
+        <thead>
+          <tr>
+            <th align="left">Id</th>
+            <th align="left">Name</th>
+            <th align="left">Phone</th>
+            <th align="left">Type</th>
+            <th align="left">Employees</th>
+          </tr>
+        </thead>
+        <tbody>
+          {accounts.map((a) => (
+            <tr key={a.Id}>
+              <td>{a.Id}</td>
+              <td>{a.Name}</td>
+              <td>{a.Phone}</td>
+              <td>{a.Type}</td>
+              <td>{a.NumberOfEmployees}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```
+
+---
+
+## 7) Step-by-Step: Build and Package for Salesforce
+
+### 7.1 Build
+```bash
+npm run build
+```
+
+### 7.2 Confirm build output structure
+Inside `build/`, you must have:
+- `index.html`
+- `manifest.json`
+- `static/` folder
+
+### 7.3 Create zip
+Zip the **contents** of `build/` (not the folder itself). The zip root should contain `index.html` directly.
+
+Example structure inside the zip:
+- `index.html`
+- `manifest.json`
+- `static/js/...`
+- `static/css/...`
+
+---
+
+## 8) Step-by-Step: Add Static Resource + Aura Container
+
+### 8.1 Static Resource (metadata project)
+Place the zip in your SFDX project:
+- `force-app/main/default/staticresources/ReactApp.resource`
+
+Add metadata:
+- `force-app/main/default/staticresources/ReactApp.resource-meta.xml`
+
+Example:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<StaticResource xmlns="http://soap.sforce.com/2006/04/metadata">
+  <cacheControl>Private</cacheControl>
+  <contentType>application/zip</contentType>
+</StaticResource>
+```
+
+### 8.2 Aura component wrapper
+Create:
+- `force-app/main/default/aura/ReactContainer/ReactContainer.cmp`
+
+```xml
+<aura:component access="global"
+                implements="flexipage:availableForAllPageTypes,force:appHostable">
+
+  <lightning:container aura:id="ReactApp"
+                      src="{!$Resource.ReactApp + '/index.html'}" />
+
+</aura:component>
+```
+
+Optional (recommended): add `onmessage` / `onerror` handlers for troubleshooting.
+
+---
+
+## 9) Step-by-Step: Make It Launchable from App Launcher
+
+### 9.1 Create a Lightning Tab (Aura tab)
+Create:
+- `force-app/main/default/tabs/ReactContainer.tab-meta.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomTab xmlns="http://soap.sforce.com/2006/04/metadata">
+  <auraComponent>ReactContainer</auraComponent>
+  <label>React Enterprise App</label>
+  <motif>Custom57: Building Block</motif>
+</CustomTab>
+```
+
+### 9.2 Add to an App (optional)
+You can:
+- Add the tab to an existing Lightning App, OR
+- Create a new custom app in metadata.
+
+### 9.3 Permission Set (recommended)
+Create:
+- `force-app/main/default/permissionsets/ReactAppAccess.permissionset-meta.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+  <label>React App Access</label>
+  <hasActivationRequired>false</hasActivationRequired>
+  <tabSettings>
+    <tab>ReactContainer</tab>
+    <visibility>Visible</visibility>
+  </tabSettings>
+</PermissionSet>
+```
+
+---
+
+## 10) Deploy to Salesforce
+
+From your project root:
+```bash
+sf project deploy start
+```
+
+Assign permission set:
+```bash
+sf org assign permset -n ReactAppAccess
+```
+
+Open the org:
+```bash
+sf org open
+```
+
+Launch:
+- App Launcher → search your tab/app label (e.g., “React Enterprise App”)
+
+---
+
+## 11) Troubleshooting (Most Common Errors)
+
+### A) “Controller not found for 'YourController'”
+Meaning:
+- The remoting runtime cannot find the specified controller.
+
+Fix checklist:
+- `manifest.json` points to correct `apex-controller`.
+- The controller exists in org.
+- Methods are annotated with `@RemoteAction`.
+
+### B) “Parameter length does not match remote action parameters”
+Meaning:
+- Visualforce Remoting received the wrong number of parameters.
+
+Fix checklist:
+- Ensure your remoting call passes parameters as individual arguments (spread), not as a single array.
+
+### C) “Insufficient permissions: secure query included inaccessible field”
+Meaning:
+- You used `WITH SECURITY_ENFORCED` and selected a field user cannot access.
+
+Fix options:
+- Only query the fields the UI needs.
+- Or grant field permissions via Permission Set.
+
+### D) “Lightning Container is not available”
+Meaning:
+- You opened the React build outside LCC (e.g., local dev server) and remoting isn’t present.
+
+Fix:
+- Test inside Salesforce via the Aura `lightning:container` wrapper.
+
+---
+
+## 12) Security Notes (Professional Guidance)
+
+- Do not embed secrets in the React bundle.
+- Do not send API keys via LCC message passing.
+- Prefer `WITH SECURITY_ENFORCED` + minimal field selection.
+- Treat the iframe boundary as a security boundary; keep message payloads minimal.
+
+---
+
+## 13) Summary
+
+You implemented:
+- A React UI hosted by Salesforce via Static Resource + Aura `lightning:container`
+- A remoting Apex controller (`@RemoteAction`) returning live Salesforce data
+- A React client that calls Apex at runtime and renders results
+- Metadata (tab/permset/app) so users can launch from App Launcher
+
